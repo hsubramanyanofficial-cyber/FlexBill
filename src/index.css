@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+/* Hide scrollbars for chrome, safari, firefox and edge */
+.no-scrollbar::-webkit-scrollbar, .scrollbar-hide::-webkit-scrollbar {
+  display: none !important;
+}
+.no-scrollbar, .scrollbar-hide {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+
+body {
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  background-color: #f8fafc; /* bg-slate-50 */
+}

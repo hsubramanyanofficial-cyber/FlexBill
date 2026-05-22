@@ -1,0 +1,8 @@
+{
+  "name": "FlexBill",
+  "description": "Premium progressive web app billing and Point-of-Sale solution for groceries, restaurants, apparel, pharmacies, and general retail stores.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
