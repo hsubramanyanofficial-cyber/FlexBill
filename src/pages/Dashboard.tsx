@@ -58,6 +58,8 @@ export default function Dashboard() {
   const [alertSortOrder, setAlertSortOrder] = useState<'critical' | 'expiry'>('critical');
   const [showBulkRestockModal, setShowBulkRestockModal] = useState(false);
   const [bulkRestockAmounts, setBulkRestockAmounts] = useState<Record<string, number>>({});
+  const [selectedBulkProductIds, setSelectedBulkProductIds] = useState<string[]>([]);
+  const [bulkSuccessMessage, setBulkSuccessMessage] = useState<string | null>(null);
 
   const exportInventoryToCSV = () => {
     const headers = ['Name', 'SKU', 'Barcode', 'Category', 'Price', 'Stock', 'Min Stock', 'Unit'];
@@ -83,6 +85,29 @@ export default function Dashboard() {
     URL.revokeObjectURL(url);
   };
 
+  const handleDownloadMovementHistory = (p: any) => {
+    const prodMovements = movements.filter(m => m.productId === p.id && (m.type === 'restock' || m.type === 'adjustment'));
+    const headers = ['Movement ID', 'Date', 'Type', 'Amount Changed', 'Notes', 'Handled By'];
+    const rows = prodMovements.map(m => [
+      `"${m.id}"`,
+      `"${new Date(m.date).toLocaleString()}"`,
+      `"${(m.type || 'RESTOCK').toUpperCase()}"`,
+      `${m.changeAmount > 0 ? '+' : ''}${m.changeAmount}`,
+      `"${(m.notes || '').replace(/"/g, '""')}"`,
+      `"${(m.user || 'Admin').replace(/"/g, '""')}"`
+    ]);
+    const csvContent = "\uFEFF" + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `movement_history_${p.name.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   // 1. Date filters & metrics calculation
   const currencySymbol = storeConfig?.currencySymbol || '₹';
   const todayStr = new Date().toISOString().substring(0, 10);
@@ -92,8 +117,27 @@ export default function Dashboard() {
   const totalOrdersToday = todayBills.length;
 
   const totalSalesAllTime = bills.reduce((acc, b) => acc + b.grandTotal, 0);
-  const lowStockProds = products.filter(p => p.stock <= p.minStock);
-  const hasCriticalLowStock = lowStockProds.some(p => p.stock <= p.minStock * 0.5 || p.stock === 0);
+  const rawLowStockProds = products.filter(p => p.stock <= p.minStock);
+  const hasCriticalLowStock = rawLowStockProds.some(p => p.stock <= p.minStock * 0.5 || p.stock === 0);
+
+  const lowStockProds = [...rawLowStockProds].sort((a, b) => {
+    if (alertSortOrder === 'critical') {
+      const pctA = a.minStock > 0 ? (a.stock / a.minStock) : 0;
+      const pctB = b.minStock > 0 ? (b.stock / b.minStock) : 0;
+      return pctA - pctB;
+    } else {
+      const hasExpA = !!a.expiryDate;
+      const hasExpB = !!b.expiryDate;
+      if (!hasExpA && !hasExpB) {
+        const pctA = a.minStock > 0 ? (a.stock / a.minStock) : 0;
+        const pctB = b.minStock > 0 ? (b.stock / b.minStock) : 0;
+        return pctA - pctB;
+      }
+      if (!hasExpA) return 1;
+      if (!hasExpB) return -1;
+      return new Date(a.expiryDate).getTime() - new Date(b.expiryDate).getTime();
+    }
+  });
 
   // Play audio alert warning using Web Audio Synthesizer
   const playAlertSound = React.useCallback(() => {
@@ -166,18 +210,18 @@ export default function Dashboard() {
   const getSupplierContact = (category: string) => {
     const norm = (category || 'General').toLowerCase();
     if (norm.includes('staple') || norm.includes('grocery') || norm.includes('food')) {
-      return { name: 'Bharat Kirana Wholesale Ltd.', phone: '+91 98300 12345', email: 'orders@bharatkirana.in' };
+      return { name: 'Bharat Kirana Wholesale Ltd.', phone: '+91 98300 12345', email: 'orders@bharatkirana.in', rating: 4 };
     }
     if (norm.includes('pharma') || norm.includes('med') || norm.includes('tablet')) {
-      return { name: 'Apex Drugs & Pharma Distributors', phone: '+91 94440 98765', email: 'dispatch@apexpharma.co.in' };
+      return { name: 'Apex Drugs & Pharma Distributors', phone: '+91 94440 98765', email: 'dispatch@apexpharma.co.in', rating: 5 };
     }
     if (norm.includes('cloth') || norm.includes('apparel') || norm.includes('wear')) {
-      return { name: 'Galaxy Garments & Textiles', phone: '+91 80220 55667', email: 'info@galaxygarments.com' };
+      return { name: 'Galaxy Garments & Textiles', phone: '+91 80220 55667', email: 'info@galaxygarments.com', rating: 3 };
     }
     if (norm.includes('electro') || norm.includes('digital') || norm.includes('gadget')) {
-      return { name: 'Supernova Digital Importers', phone: '+91 90088 11223', email: 'b2b@supernovadigital.in' };
+      return { name: 'Supernova Digital Importers', phone: '+91 90088 11223', email: 'b2b@supernovadigital.in', rating: 4 };
     }
-    return { name: 'Universal Retail Supplies Inc.', phone: '+91 99000 88811', email: 'supply@universalretail.com' };
+    return { name: 'Universal Retail Supplies Inc.', phone: '+91 99000 88811', email: 'supply@universalretail.com', rating: 4 };
   };
   
   // Chart calculation
@@ -543,7 +587,18 @@ export default function Dashboard() {
               <button
                 id="bulk-restock-btn"
                 type="button"
-                onClick={() => setShowBulkRestockModal(true)}
+                onClick={() => {
+                  const initAmounts: Record<string, number> = {};
+                  const initIds: string[] = [];
+                  rawLowStockProds.forEach(p => {
+                    initIds.push(p.id);
+                    const suggested = Math.max(10, (p.minStock * 2) - p.stock);
+                    initAmounts[p.id] = suggested;
+                  });
+                  setBulkRestockAmounts(initAmounts);
+                  setSelectedBulkProductIds(initIds);
+                  setShowBulkRestockModal(true);
+                }}
                 className="px-2.5 py-1 text-[9px] font-black uppercase tracking-wider bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 dark:bg-slate-950 dark:hover:bg-slate-900 dark:text-indigo-400 dark:border-slate-800 rounded-lg cursor-pointer transition-colors flex items-center gap-1"
               >
                 <Layers size={11} className="stroke-[2.5px]" />
@@ -771,10 +826,27 @@ export default function Dashboard() {
                           <div className="mt-3 pt-3 border-t border-dashed border-slate-200 dark:border-slate-800 grid grid-cols-2 gap-4 text-[10px]">
                             {/* Supplier details block */}
                             <div className="space-y-1 text-left">
-                              <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Supplier Details</span>
+                              <div className="flex items-center gap-1.5 justify-between">
+                                <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Supplier Details</span>
+                                <div className="flex items-center gap-0.5" title={`Supplier reliability rating: ${supplier.rating}/5 stars`}>
+                                  {[1, 2, 3, 4, 5].map((star) => (
+                                    <span 
+                                      key={star} 
+                                      className={`text-[9px] leading-none ${
+                                        star <= supplier.rating 
+                                          ? 'text-amber-500 dark:text-amber-400 font-bold' 
+                                          : 'text-slate-200 dark:text-slate-700'
+                                      }`}
+                                    >
+                                      ★
+                                    </span>
+                                  ))}
+                                  <span className="text-[7.5px] text-slate-400 dark:text-slate-550 font-extrabold ml-1 font-mono">({supplier.rating}.0)</span>
+                                </div>
+                              </div>
                               <p className="font-extrabold text-slate-800 dark:text-slate-200 leading-tight">{supplier.name}</p>
-                              <p className="text-[9px] text-slate-500 dark:text-slate-450 font-medium font-mono">{supplier.phone}</p>
-                              <p className="text-[9px] text-slate-500 dark:text-slate-450 font-medium font-mono mb-2">{supplier.email}</p>
+                              <p className="text-[9px] text-slate-550 dark:text-slate-450 font-medium font-mono">{supplier.phone}</p>
+                              <p className="text-[9px] text-slate-555 dark:text-slate-450 font-medium font-mono mb-2">{supplier.email}</p>
                               <div className="flex flex-wrap gap-1.5 pt-1">
                                 <a
                                   href={`tel:${supplier.phone}`}
@@ -796,11 +868,26 @@ export default function Dashboard() {
                             </div>
 
                             {/* Meta properties block */}
-                            <div className="space-y-1 text-left">
-                              <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Meta Properties</span>
-                              <p className="font-semibold text-slate-705 dark:text-slate-300">SKU: <span className="font-mono font-bold text-slate-900 dark:text-slate-100">{p.sku}</span></p>
-                              <p className="text-[9px] text-slate-550 dark:text-slate-400 font-medium">Category: <span className="capitalize">{p.category}</span></p>
-                              <p className="text-[9px] text-slate-550 dark:text-slate-400 font-medium">Last Restock: <span className="font-semibold">{lastRestockDate}</span></p>
+                            <div className="space-y-1 text-left flex flex-col justify-between">
+                              <div>
+                                <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Meta Properties</span>
+                                <p className="font-semibold text-slate-705 dark:text-slate-300">SKU: <span className="font-mono font-bold text-slate-900 dark:text-slate-100">{p.sku}</span></p>
+                                <p className="text-[9px] text-slate-550 dark:text-slate-400 font-medium">Category: <span className="capitalize">{p.category}</span></p>
+                                <p className="text-[9px] text-slate-550 dark:text-slate-400 font-medium">Last Restock: <span className="font-semibold">{lastRestockDate}</span></p>
+                              </div>
+                              <div className="pt-2">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDownloadMovementHistory(p);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-amber-500 hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-700 text-white rounded-lg text-[8px] font-black uppercase tracking-wider transition-all duration-150 border border-amber-600/25"
+                                >
+                                  <Download size={9} className="stroke-[2.5px]" />
+                                  <span>Download History</span>
+                                </button>
+                              </div>
                             </div>
 
                             {/* Batch Expiries Tag detail panel for pharmaceutical or grocery items */}
@@ -1021,8 +1108,163 @@ export default function Dashboard() {
           </div>
         </div>     </div>
 
-      </div>
+        {/* Bulk Restock Modal Dialog */}
+        <AnimatePresence>
+          {showBulkRestockModal && (
+            <div className="fixed inset-0 bg-slate-900/60 dark:bg-slate-950/80 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 15 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 15 }}
+                transition={{ duration: 0.2 }}
+                className="bg-white dark:bg-slate-900 w-full max-w-xl rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col max-h-[85vh] text-[11px]"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50 dark:bg-slate-900/40">
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-900/40 text-indigo-700 dark:text-indigo-400 rounded-lg">
+                      <Layers size={14} className="stroke-[2.5px]" />
+                    </div>
+                    <div>
+                      <h4 className="font-extrabold uppercase tracking-wider text-slate-800 dark:text-slate-100 text-[10px]">Bulk Restock Items</h4>
+                      <p className="text-[9px] text-slate-400 dark:text-slate-500 font-bold">Resupply replenishment suggestions simultaneously</p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowBulkRestockModal(false)}
+                    className="p-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-550 dark:text-slate-300 rounded-lg cursor-pointer transition-colors"
+                  >
+                    <Plus size={12} className="rotate-45" />
+                  </button>
+                </div>
 
+                <div className="overflow-y-auto p-4 space-y-3 flex-1 custom-scrollbar w-full">
+                  {rawLowStockProds.length === 0 ? (
+                    <div className="text-center py-8">
+                      <p className="text-slate-500 italic">No low-stock items require replenishment at this time.</p>
+                    </div>
+                  ) : (
+                    rawLowStockProds.map((p) => {
+                      const isChecked = selectedBulkProductIds.includes(p.id);
+                      const restockQty = bulkRestockAmounts[p.id] || 0;
+                      return (
+                        <div 
+                          key={p.id}
+                          className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
+                            isChecked 
+                              ? 'bg-indigo-50/30 border-indigo-200 dark:bg-indigo-950/10 dark:border-indigo-900/50' 
+                              : 'bg-slate-50/50 border-slate-150 dark:bg-slate-900/20 dark:border-slate-800/60'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <input 
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => {
+                                if (isChecked) {
+                                  setSelectedBulkProductIds(prev => prev.filter(id => id !== p.id));
+                                } else {
+                                  setSelectedBulkProductIds(prev => [...prev, p.id]);
+                                }
+                              }}
+                              className="w-3.5 h-3.5 text-indigo-600 border-slate-300 rounded cursor-pointer"
+                            />
+                            <div className="text-left font-sans">
+                              <p className="font-extrabold text-slate-800 dark:text-slate-250 leading-snug">{p.name}</p>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className="font-mono text-[8px] bg-slate-100 dark:bg-slate-800 text-slate-500 px-1 py-0.5 rounded font-bold">{p.sku}</span>
+                                <span className="text-[9px] text-slate-500">
+                                  Stock: <strong className="text-rose-600">{p.stock}</strong> / min: {p.minStock} {p.unit}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] text-slate-400 font-bold font-mono">QTY:</span>
+                            <input 
+                              type="number"
+                              min={1}
+                              value={restockQty}
+                              disabled={!isChecked}
+                              onChange={(e) => {
+                                const val = Math.max(1, parseInt(e.target.value) || 0);
+                                setBulkRestockAmounts(prev => ({ ...prev, [p.id]: val }));
+                              }}
+                              className={`w-16 px-2 py-1 border rounded-lg text-center font-bold font-mono text-[10px] focus:outline-none ${
+                                isChecked 
+                                  ? 'bg-white dark:bg-slate-950 border-slate-300 dark:border-slate-700 text-slate-900 dark:text-slate-100 focus:ring-1 focus:ring-indigo-500' 
+                                  : 'bg-slate-100 dark:bg-slate-800 text-slate-400 border-slate-200 dark:border-slate-800'
+                              }`}
+                            />
+                            <span className="text-[8.5px] text-slate-455 font-extrabold select-none lowercase w-8 text-left">{p.unit}</span>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 flex justify-between items-center bg-slate-50 dark:bg-slate-900/20">
+                  <div className="text-[9px] text-slate-500 font-semibold font-sans">
+                    Selected: <strong className="text-indigo-600 dark:text-indigo-400">{selectedBulkProductIds.length}</strong> items
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowBulkRestockModal(false)}
+                      className="px-3 py-1.5 rounded-lg border border-slate-250 dark:border-slate-700 text-slate-705 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 font-bold transition-all text-[9.5px]/none uppercase tracking-wider cursor-pointer font-sans"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedBulkProductIds.length === 0}
+                      onClick={async () => {
+                        let successCount = 0;
+                        for (const id of selectedBulkProductIds) {
+                          const amt = bulkRestockAmounts[id] || 0;
+                          if (amt > 0) {
+                            await restockProduct(id, amt, 'Bulk Restock Action (Admin)');
+                            successCount++;
+                          }
+                        }
+                        setShowBulkRestockModal(false);
+                        playAlertSound();
+                        if (successCount > 0) {
+                          setBulkSuccessMessage(`Batch restock completed successfully for ${successCount} items!`);
+                          setTimeout(() => {
+                            setBulkSuccessMessage(null);
+                          }, 3500);
+                        }
+                      }}
+                      className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-250 disabled:dark:bg-slate-800 text-white font-black transition-all text-[9.5px]/none uppercase tracking-wider disabled:text-slate-400 disabled:cursor-not-allowed shadow-md hover:-translate-y-0.5 font-sans"
+                    >
+                      Restock Selected
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Global/Bulk Success Toast Message Alert */}
+        <AnimatePresence>
+          {bulkSuccessMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: 50, scale: 0.9 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.9 }}
+              className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-emerald-600 text-white px-5 py-3 rounded-2xl shadow-xl border border-emerald-500/30 flex items-center gap-3 z-50 text-[10px] font-bold uppercase tracking-wider"
+            >
+              <div className="w-5 h-5 rounded-full bg-emerald-500/30 flex items-center justify-center font-bold text-xs font-sans">✓</div>
+              <span className="font-sans">{bulkSuccessMessage}</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
