@@ -25,7 +25,9 @@ import {
   Volume2,
   VolumeX,
   Layers,
-  Bell
+  Bell,
+  CheckCircle,
+  Edit
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAppStore } from '../store/appStore';
@@ -37,11 +39,13 @@ import {
   YAxis, 
   CartesianGrid, 
   Tooltip, 
-  ResponsiveContainer
+  ResponsiveContainer,
+  LineChart,
+  Line
 } from 'recharts';
 
 export default function Dashboard() {
-  const { bills, products, customers, movements, storeConfig, restockProduct, setScreen, darkMode, setAutoOpenAddProductModal, addOrUpdateProduct } = useAppStore();
+  const { bills, products, customers, movements, storeConfig, restockProduct, setScreen, darkMode, setAutoOpenAddProductModal, addOrUpdateProduct, addNotification } = useAppStore();
   const [successRestockId, setSuccessRestockId] = useState<string | null>(null);
   const [showQuickActions, setShowQuickActions] = useState(false);
   const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
@@ -60,6 +64,83 @@ export default function Dashboard() {
   const [bulkRestockAmounts, setBulkRestockAmounts] = useState<Record<string, number>>({});
   const [selectedBulkProductIds, setSelectedBulkProductIds] = useState<string[]>([]);
   const [bulkSuccessMessage, setBulkSuccessMessage] = useState<string | null>(null);
+  const [onlyCritical, setOnlyCritical] = useState(false);
+  const [resolvedAlertIds, setResolvedAlertIds] = useState<string[]>([]);
+
+  // Persistent Supplier Contact Information Override mapping
+  const [supplierOverrides, setSupplierOverrides] = useState<Record<string, { name: string; phone: string; email: string; rating: number }>>(() => {
+    try {
+      const saved = localStorage.getItem('supplier_overrides');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  // Custom Alarm/Pulse visual priority levels mapping (High / Medium / Low)
+  const [customPriorities, setCustomPriorities] = useState<Record<string, 'high' | 'medium' | 'low'>>(() => {
+    try {
+      const saved = localStorage.getItem('alert_priorities');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  // State for calculated product stock depletion forecasts
+  const [forecasts, setForecasts] = useState<Record<string, { dailyRate: number; daysRemaining: number; message: string }>>({});
+
+  // Edit Supplier Modal visual triggers and buffers
+  const [showEditSupplierModal, setShowEditSupplierModal] = useState(false);
+  const [editingSupplierProduct, setEditingSupplierProduct] = useState<any>(null);
+  const [editSupplierName, setEditSupplierName] = useState('');
+  const [editSupplierPhone, setEditSupplierPhone] = useState('');
+  const [editSupplierEmail, setEditSupplierEmail] = useState('');
+  const [editSupplierRating, setEditSupplierRating] = useState(4);
+
+  const handleUpdatePriority = (prodId: string, priority: 'high' | 'medium' | 'low') => {
+    const next = { ...customPriorities, [prodId]: priority };
+    setCustomPriorities(next);
+    try {
+      localStorage.setItem('alert_priorities', JSON.stringify(next));
+    } catch (e) {
+      console.warn("localStorage save failed", e);
+    }
+  };
+
+  const calculateForecast = (p: any) => {
+    const sMovements = movements.filter(m => m.productId === p.id && m.type === 'sale');
+    const totalSold = sMovements.reduce((sum, m) => sum + Math.abs(m.changeAmount), 0);
+    
+    if (totalSold === 0) {
+      return {
+        dailyRate: 0,
+        daysRemaining: Infinity,
+        message: "No sales recorded in history yet.",
+      };
+    }
+    
+    const dates = sMovements.map(m => new Date(m.date).getTime());
+    const oldest = dates.length > 0 ? Math.min(...dates) : new Date().getTime();
+    const daysD = Math.max(1, (new Date().getTime() - oldest) / (1000 * 60 * 60 * 24));
+    const dailyRate = totalSold / daysD; // items per day
+    
+    if (dailyRate <= 0) {
+      return {
+        dailyRate: 0,
+        daysRemaining: Infinity,
+        message: "Sales rate is too low to compute.",
+      };
+    }
+    
+    const daysRemaining = p.stock / dailyRate;
+    
+    return {
+      dailyRate,
+      daysRemaining,
+      message: `Consumption: ${dailyRate.toFixed(2)} ${p.unit}/day. Expected depletion in ${Math.ceil(daysRemaining)} days.`
+    };
+  };
 
   const exportInventoryToCSV = () => {
     const headers = ['Name', 'SKU', 'Barcode', 'Category', 'Price', 'Stock', 'Min Stock', 'Unit'];
@@ -117,10 +198,14 @@ export default function Dashboard() {
   const totalOrdersToday = todayBills.length;
 
   const totalSalesAllTime = bills.reduce((acc, b) => acc + b.grandTotal, 0);
-  const rawLowStockProds = products.filter(p => p.stock <= p.minStock);
+  const rawLowStockProds = products.filter(p => p.stock <= p.minStock && !resolvedAlertIds.includes(p.id));
   const hasCriticalLowStock = rawLowStockProds.some(p => p.stock <= p.minStock * 0.5 || p.stock === 0);
 
-  const lowStockProds = [...rawLowStockProds].sort((a, b) => {
+  const displayedLowStockProds = onlyCritical 
+    ? rawLowStockProds.filter(p => p.stock <= p.minStock * 0.5 || p.stock === 0)
+    : rawLowStockProds;
+
+  const lowStockProds = [...displayedLowStockProds].sort((a, b) => {
     if (alertSortOrder === 'critical') {
       const pctA = a.minStock > 0 ? (a.stock / a.minStock) : 0;
       const pctB = b.minStock > 0 ? (b.stock / b.minStock) : 0;
@@ -207,8 +292,12 @@ export default function Dashboard() {
     }
   }, [lowStockProds, movements, notifiedSuppliers]);
 
-  const getSupplierContact = (category: string) => {
-    const norm = (category || 'General').toLowerCase();
+  const getSupplierContact = (p: any) => {
+    if (p && p.id && supplierOverrides[p.id]) {
+      return supplierOverrides[p.id];
+    }
+    const category = p?.category || 'General';
+    const norm = category.toLowerCase();
     if (norm.includes('staple') || norm.includes('grocery') || norm.includes('food')) {
       return { name: 'Bharat Kirana Wholesale Ltd.', phone: '+91 98300 12345', email: 'orders@bharatkirana.in', rating: 4 };
     }
@@ -548,17 +637,43 @@ export default function Dashboard() {
               : 'border-slate-200 dark:border-slate-800'
           }`}
         >
-          {hasCriticalLowStock && (
-            <style dangerouslySetInnerHTML={{ __html: `
-              @keyframes border-pulse-critical {
-                0%, 100% { border-color: rgb(239, 68, 68); box-shadow: 0 0 12px rgba(239, 68, 68, 0.35); }
-                50% { border-color: rgba(239, 68, 68, 0.4); box-shadow: 0 0 2px rgba(239, 68, 68, 0); }
-              }
-              .critical-border-glow {
-                animation: border-pulse-critical 2s infinite ease-in-out !important;
-              }
-            `}} />
-          )}
+          <style dangerouslySetInnerHTML={{ __html: `
+            @keyframes border-pulse-critical {
+              0%, 100% { border-color: rgb(239, 68, 68); box-shadow: 0 0 12px rgba(239, 68, 68, 0.35); }
+              50% { border-color: rgba(239, 68, 68, 0.4); box-shadow: 0 0 2px rgba(239, 68, 68, 0); }
+            }
+            @keyframes border-pulse-zero {
+              0%, 100% { border-color: rgb(220, 38, 38); box-shadow: 0 0 10px rgba(220, 38, 38, 0.5); }
+              50% { border-color: rgba(220, 38, 38, 0.3); box-shadow: 0 0 2px rgba(220, 38, 38, 0.1); }
+            }
+            @keyframes border-pulse-high {
+              0%, 100% { border-color: rgb(239, 68, 68); box-shadow: 0 0 11px rgba(239, 68, 68, 0.45); }
+              50% { border-color: rgba(239, 68, 68, 0.3); box-shadow: 0 0 2px rgba(239, 68, 68, 0.05); }
+            }
+            @keyframes border-pulse-medium {
+              0%, 100% { border-color: rgb(245, 158, 11); box-shadow: 0 0 9px rgba(245, 158, 11, 0.3); }
+              50% { border-color: rgba(245, 158, 11, 0.25); box-shadow: 0 0 2px rgba(245, 158, 11, 0.05); }
+            }
+            @keyframes border-pulse-low {
+              0%, 100% { border-color: rgb(156, 163, 175); box-shadow: 0 0 6px rgba(156, 163, 175, 0.2); }
+              50% { border-color: rgba(156, 163, 175, 0.15); box-shadow: 0 0 1px rgba(156, 163, 175, 0); }
+            }
+            .critical-border-glow {
+              animation: border-pulse-critical 2s infinite ease-in-out !important;
+            }
+            .zero-stock-pulse {
+              animation: border-pulse-zero 1.7s infinite ease-in-out !important;
+            }
+            .pulse-freq-high {
+              animation: border-pulse-high 0.8s infinite ease-in-out !important;
+            }
+            .pulse-freq-medium {
+              animation: border-pulse-medium 2.2s infinite ease-in-out !important;
+            }
+            .pulse-freq-low {
+              animation: border-pulse-low 4.5s infinite ease-in-out !important;
+            }
+          `}} />
 
           <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3 flex-wrap gap-2">
             <div className="flex items-center gap-2">
@@ -572,6 +687,17 @@ export default function Dashboard() {
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
+              {/* Only Critical Toggle Checkbox */}
+              <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[9px] font-black uppercase tracking-wider border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg cursor-pointer transition-colors hover:bg-slate-50 dark:hover:bg-slate-705 select-none">
+                <input
+                  type="checkbox"
+                  checked={onlyCritical}
+                  onChange={(e) => setOnlyCritical(e.target.checked)}
+                  className="w-3 h-3 text-rose-600 border-slate-350 dark:border-slate-650 rounded-sm cursor-pointer accent-rose-600"
+                />
+                <span>Only Critical</span>
+              </label>
+
               {/* Sorting Options Dropdown */}
               <select
                 id="alert-sort-selector"
@@ -667,7 +793,7 @@ export default function Dashboard() {
               lowStockProds.map((p) => {
                 const isRestocked = successRestockId === p.id;
                 const isExpanded = expandedProductId === p.id;
-                const supplier = getSupplierContact(p.category);
+                const supplier = getSupplierContact(p);
                 
                 // Get last restock date from movements
                 const prodMovements = movements.filter(m => m.productId === p.id && m.type === 'restock');
@@ -746,14 +872,19 @@ export default function Dashboard() {
                   { batchCode: p.batchNumber ? p.batchNumber + '-XM' : 'B-M772-ALT', stock: Math.ceil(p.stock * 0.4) + 15, expiry: new Date(new Date(p.expiryDate || todayStr).getTime() + 65 * 24 * 60 * 60 * 1000).toISOString().substring(0, 10) }
                 ] : [];
 
+                const priority = customPriorities[p.id] || 'medium';
+                const pulseClass = priority === 'high' ? 'pulse-freq-high' : priority === 'low' ? 'pulse-freq-low' : 'pulse-freq-medium';
+
                 return (
                   <div 
                     key={p.id} 
                     onClick={() => setExpandedProductId(isExpanded ? null : p.id)}
-                    className={`p-4 border rounded-xl transition-all cursor-pointer select-none ${
-                      isExpanded 
-                        ? 'border-indigo-500 dark:border-indigo-650 bg-indigo-50/10 dark:bg-indigo-950/10 shadow-sm' 
-                        : 'border-rose-100 dark:border-rose-900/50 bg-rose-50/15 dark:bg-rose-950/10 hover:bg-rose-50/25 dark:hover:bg-rose-950/15'
+                    className={`p-4 border rounded-xl transition-all cursor-pointer select-none ${pulseClass} ${
+                      p.stock === 0
+                        ? 'border-red-500 bg-red-500/5 dark:bg-rose-950/10'
+                        : isExpanded 
+                          ? 'border-indigo-500 dark:border-indigo-650 bg-indigo-50/10 dark:bg-indigo-950/10 shadow-sm' 
+                          : 'border-rose-100 dark:border-rose-900/50 bg-rose-50/15 dark:bg-rose-950/10 hover:bg-rose-50/25 dark:hover:bg-rose-950/15'
                     }`}
                   >
                     <div className="flex items-center justify-between">
@@ -782,6 +913,23 @@ export default function Dashboard() {
                       </div>
                       
                       <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            setResolvedAlertIds(prev => [...prev, p.id]);
+                            await addNotification(
+                              'Alert Resolved',
+                              `Low stock alert for "${p.name}" has been marked as resolved.`,
+                              'success'
+                            );
+                          }}
+                          className="px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-750 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-xl transition-colors flex items-center gap-1 cursor-pointer shadow-xs shrink-0"
+                        >
+                          <CheckCircle size={11} className="text-emerald-600 dark:text-emerald-400 stroke-[2.5px]" />
+                          <span>Resolve</span>
+                        </button>
+
                         <button
                           type="button"
                           disabled={isRestocked}
@@ -864,6 +1012,22 @@ export default function Dashboard() {
                                   <Mail size={9} />
                                   Email Order
                                 </a>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingSupplierProduct(p);
+                                    setEditSupplierName(supplier.name);
+                                    setEditSupplierPhone(supplier.phone);
+                                    setEditSupplierEmail(supplier.email);
+                                    setEditSupplierRating(supplier.rating);
+                                    setShowEditSupplierModal(true);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-teal-50 hover:bg-teal-150 dark:bg-emerald-950/20 dark:hover:bg-emerald-900/30 text-teal-700 dark:text-emerald-400 rounded-lg text-[8px] font-bold uppercase tracking-wider transition-colors border border-teal-100 dark:border-emerald-900/30"
+                                >
+                                  <Edit size={9} />
+                                  Edit Supplier
+                                </button>
                               </div>
                             </div>
 
@@ -950,6 +1114,70 @@ export default function Dashboard() {
                               </p>
                             </div>
 
+                            {/* Priority Selection block */}
+                            <div className="space-y-1 text-left">
+                              <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Custom Notification Priority</span>
+                              <div className="flex items-center gap-1 mt-1">
+                                {(['low', 'medium', 'high'] as const).map((prio) => {
+                                  const selected = (customPriorities[p.id] || 'medium') === prio;
+                                  return (
+                                    <button
+                                      key={prio}
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleUpdatePriority(p.id, prio);
+                                      }}
+                                      className={`px-2 py-1 text-[8.5px] font-extrabold uppercase tracking-wider rounded-lg transition-all border ${
+                                        selected
+                                          ? prio === 'high'
+                                            ? 'bg-rose-500 border-rose-500 text-white'
+                                            : prio === 'medium'
+                                              ? 'bg-amber-500 border-amber-500 text-white'
+                                              : 'bg-slate-500 border-slate-500 text-white'
+                                          : 'bg-white hover:bg-slate-50 dark:bg-slate-900 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-800'
+                                      }`}
+                                    >
+                                      {prio}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <p className="text-[7.5px] text-slate-400 dark:text-slate-500">
+                                Changes visual border pulse speed.
+                              </p>
+                            </div>
+
+                            {/* Forecast Restock block */}
+                            <div className="space-y-1 text-left">
+                              <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px]">Forecast Restock Estimate</span>
+                              <div className="mt-1 flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const forecast = calculateForecast(p);
+                                    setForecasts(prev => ({ ...prev, [p.id]: forecast }));
+                                  }}
+                                  className="px-2.5 py-1 bg-teal-600 hover:bg-teal-700 text-white font-black text-[9px] uppercase tracking-wider rounded-lg transition-colors cursor-pointer leading-none"
+                                >
+                                  Forecast Restock
+                                </button>
+                                {forecasts[p.id] && (
+                                  <span className="text-[9px] font-bold text-slate-800 dark:text-slate-200 font-sans">
+                                    {forecasts[p.id].daysRemaining === Infinity
+                                      ? '∞ Days'
+                                      : `${Math.ceil(forecasts[p.id].daysRemaining)} Days`}
+                                  </span>
+                                )}
+                              </div>
+                              {forecasts[p.id] && (
+                                <p className="text-[7.5px] text-indigo-600 dark:text-indigo-400 font-bold leading-tight">
+                                  {forecasts[p.id].message}
+                                </p>
+                              )}
+                            </div>
+
                             {/* Automated Reorder - Notify Supplier Workflow Settings Section */}
                             <div className="col-span-2 pt-1" onClick={(e) => e.stopPropagation()}>
                               <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px] mb-1">Automated Supplier Workflow</span>
@@ -1004,36 +1232,31 @@ export default function Dashboard() {
                               <span className="text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider block text-[8px] mb-1">30-Day Stock Level Trajectory</span>
                               <div className="w-full h-[85px] bg-slate-50/50 dark:bg-slate-950/20 border border-slate-100 dark:border-slate-800/45 p-2 rounded-xl">
                                 <ResponsiveContainer width="100%" height="100%">
-                                  <AreaChart data={movementHistory} margin={{ top: 2, right: 2, left: 2, bottom: 2 }}>
-                                    <defs>
-                                      <linearGradient id={`grad-${p.id}`} x1="0" y1="0" x2="0" y2="1">
-                                        <stop offset="5%" stopColor={p.stock <= p.minStock * 0.5 ? "#f43f5e" : "#4f46e5"} stopOpacity={0.25}/>
-                                        <stop offset="95%" stopColor={p.stock <= p.minStock * 0.5 ? "#f43f5e" : "#4f46e5"} stopOpacity={0.01}/>
-                                      </linearGradient>
-                                    </defs>
+                                  <LineChart data={movementHistory} margin={{ top: 4, right: 6, left: 6, bottom: 4 }}>
                                     <CartesianGrid strokeDasharray="3 3" opacity={0.07} />
                                     <XAxis dataKey="dayName" hide={true} />
                                     <YAxis hide={true} domain={['auto', 'auto']} />
                                     <Tooltip
                                       contentStyle={{
                                         background: darkMode ? '#0f172a' : '#ffffff',
-                                        border: '1px solid opacity 0.1',
+                                        border: '1px solid rgba(148, 163, 184, 0.15)',
                                         borderRadius: '8px',
-                                        fontSize: '8.5px',
+                                        fontSize: '8px',
                                         color: darkMode ? '#f8fafc' : '#0f172a',
                                         fontWeight: 'bold',
-                                        padding: '4px 8px'
+                                        padding: '4px 6px'
                                       }}
-                                      labelStyle={{ color: '#94a3b8', fontSize: '7.5px', textTransform: 'uppercase' }}
+                                      labelStyle={{ color: '#94a3b8', fontSize: '7px', textTransform: 'uppercase' }}
                                     />
-                                    <Area 
+                                    <Line 
                                       type="monotone" 
                                       dataKey="Stock" 
-                                      stroke={p.stock <= p.minStock * 0.5 ? "#f43f5e" : "#4f46e5"} 
-                                      strokeWidth={2}
-                                      fill={`url(#grad-${p.id})`}
+                                      stroke={p.stock <= p.minStock * 0.5 ? "#f43f5e" : "#0d9488"} 
+                                      strokeWidth={1.5}
+                                      dot={false}
+                                      activeDot={{ r: 3 }}
                                     />
-                                  </AreaChart>
+                                  </LineChart>
                                 </ResponsiveContainer>
                               </div>
                             </div>
@@ -1262,6 +1485,149 @@ export default function Dashboard() {
               <div className="w-5 h-5 rounded-full bg-emerald-500/30 flex items-center justify-center font-bold text-xs font-sans">✓</div>
               <span className="font-sans">{bulkSuccessMessage}</span>
             </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Edit Supplier Contact and Rating Modal Dialog */}
+        <AnimatePresence>
+          {showEditSupplierModal && editingSupplierProduct && (
+            <div className="fixed inset-0 bg-slate-900/60 dark:bg-slate-950/80 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95, y: 15 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.95, y: 15 }}
+                transition={{ duration: 0.2 }}
+                className="bg-white dark:bg-slate-900 w-full max-w-md rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col text-[11px]"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50 dark:bg-slate-900/40">
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 bg-teal-50 dark:bg-teal-950/40 border border-teal-100 dark:border-teal-900/40 text-teal-700 dark:text-emerald-400 rounded-lg">
+                      <Edit size={14} className="stroke-[2.5px]" />
+                    </div>
+                    <div>
+                      <h4 className="font-extrabold uppercase tracking-wider text-slate-800 dark:text-slate-100 text-[10px]">Edit Supplier Contact</h4>
+                      <p className="text-[9px] text-slate-400 dark:text-slate-500 font-bold">Update information for "{editingSupplierProduct.name}"</p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowEditSupplierModal(false);
+                      setEditingSupplierProduct(null);
+                    }}
+                    className="p-1 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-550 dark:text-slate-300 rounded-lg cursor-pointer transition-colors"
+                  >
+                    <Plus size={12} className="rotate-45" />
+                  </button>
+                </div>
+
+                <div className="p-4 space-y-4 text-left">
+                  {/* Supplier Name Input */}
+                  <div className="space-y-1">
+                    <label className="text-slate-500 dark:text-slate-400 font-black uppercase text-[8px] tracking-wider block">Supplier Name</label>
+                    <input
+                      type="text"
+                      value={editSupplierName}
+                      onChange={(e) => setEditSupplierName(e.target.value)}
+                      className="w-full px-3 py-2 text-[10px] font-bold border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 rounded-lg focus:outline-none focus:border-indigo-500"
+                      placeholder="e.g. Acme Distributors Inc."
+                    />
+                  </div>
+
+                  {/* Supplier Phone Input */}
+                  <div className="space-y-1">
+                    <label className="text-slate-500 dark:text-slate-400 font-black uppercase text-[8px] tracking-wider block">Contact Phone Number</label>
+                    <input
+                      type="text"
+                      value={editSupplierPhone}
+                      onChange={(e) => setEditSupplierPhone(e.target.value)}
+                      className="w-full px-3 py-2 text-[10px] font-bold border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-955 text-slate-900 dark:text-slate-100 rounded-lg focus:outline-none focus:border-indigo-500"
+                      placeholder="e.g. +91 99000 88811"
+                    />
+                  </div>
+
+                  {/* Supplier Email Input */}
+                  <div className="space-y-1">
+                    <label className="text-slate-500 dark:text-slate-400 font-black uppercase text-[8px] tracking-wider block">Email Address</label>
+                    <input
+                      type="email"
+                      value={editSupplierEmail}
+                      onChange={(e) => setEditSupplierEmail(e.target.value)}
+                      className="w-full px-3 py-2 text-[10px] font-bold border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-955 text-slate-900 dark:text-slate-100 rounded-lg focus:outline-none focus:border-indigo-500"
+                      placeholder="e.g. orders@acme.com"
+                    />
+                  </div>
+
+                  {/* Supplier Reliability Star Rating */}
+                  <div className="space-y-1">
+                    <label className="text-slate-500 dark:text-slate-400 font-black uppercase text-[8px] tracking-wider block">Reliability Star Rating</label>
+                    <div className="flex items-center gap-1.5 mt-1.5">
+                      {[1, 2, 3, 4, 5].map((star) => (
+                        <button
+                          key={star}
+                          type="button"
+                          onClick={() => setEditSupplierRating(star)}
+                          className="text-lg hover:scale-115 transition-transform duration-100"
+                          title={`${star} Star Rating`}
+                        >
+                          <span className={`leading-none ${star <= editSupplierRating ? 'text-amber-500 dark:text-amber-400 font-bold' : 'text-slate-200 dark:text-slate-705'}`}>
+                            ★
+                          </span>
+                        </button>
+                      ))}
+                      <span className="text-[10px] font-mono font-extrabold text-slate-500 dark:text-slate-400 ml-2">({editSupplierRating}.0 / 5.0)</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/40 flex justify-end gap-2 text-right">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowEditSupplierModal(false);
+                      setEditingSupplierProduct(null);
+                    }}
+                    className="px-3.5 py-1.5 rounded-lg border border-slate-250 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 font-bold transition-all text-[9.5px]/none uppercase tracking-wider cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!editSupplierName.trim()) return;
+                      const updated = {
+                        ...supplierOverrides,
+                        [editingSupplierProduct.id]: {
+                          name: editSupplierName.trim(),
+                          phone: editSupplierPhone.trim(),
+                          email: editSupplierEmail.trim(),
+                          rating: editSupplierRating
+                        }
+                      };
+                      setSupplierOverrides(updated);
+                      try {
+                        localStorage.setItem('supplier_overrides', JSON.stringify(updated));
+                      } catch (err) {
+                        console.warn(err);
+                      }
+                      
+                      // Notify successfully and clean up
+                      addNotification(
+                        'Supplier Information Updated',
+                        `Supplier details saved for "${editingSupplierProduct.name}".`,
+                        'success'
+                      );
+                      setShowEditSupplierModal(false);
+                      setEditingSupplierProduct(null);
+                    }}
+                    className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-black transition-all text-[9.5px]/none uppercase tracking-wider shadow-md hover:-translate-y-0.5"
+                  >
+                    Save Supplier Info
+                  </button>
+                </div>
+              </motion.div>
+            </div>
           )}
         </AnimatePresence>
       </div>
